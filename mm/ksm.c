@@ -39,6 +39,7 @@
 #include <linux/freezer.h>
 #include <linux/oom.h>
 #include <linux/numa.h>
+#include <linux/timekeeping.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -278,6 +279,10 @@ static unsigned int zero_checksum __read_mostly;
 
 /* Whether to merge empty (zeroed) pages with actual zero pages */
 static bool ksm_use_zero_pages __read_mostly;
+
+/* Avg time what memcmp spend */
+static unsigned avg_memcmp_time_cell = 0;
+static long unsigned avg_memcmp_time_array[100];
 
 #ifdef CONFIG_NUMA
 /* Zeroed when merging across nodes is not allowed */
@@ -1014,22 +1019,74 @@ static u32 calc_checksum(struct page *page)
 	return checksum;
 }
 
-static int memcmp_pages(struct page *page1, struct page *page2)
+
+/*
+* memcmp used to compare pages in RB-tree
+* but on every step down the tree forward progress
+* just ignored.
+* That allow as to speedup tree lookup
+* on deep tree and/or big pages (ex. 4KiB+)
+* By add memcmp wrapper that will try to guess
+* where difference happens.
+* And on next node compare page only from that offset
+ */
+
+static int memcmpe(const void *p, const void *q, const u32 len,
+		   u32 *offset)
+{
+	const u32 max_offset_error = 8;
+	u32 iter = 1024, i = 0;
+	int ret;
+
+	if (offset == NULL)
+		return memcmp(p, q, len);
+
+	if (*offset < len)
+		i = *offset;
+
+	while (i < len) {
+		iter = min_t(u32, iter, len - i);
+		ret = memcmp(p, q, iter);
+
+		if (ret) {
+			iter = iter >> 1;
+			if (iter < max_offset_error)
+				break;
+			continue;
+		}
+
+		i += iter;
+	}
+
+	*offset = i;
+
+	return ret;
+}
+
+static int memcmp_pages(struct page *page1, struct page *page2, u32 *offset)
 {
 	char *addr1, *addr2;
 	int ret;
+	long unsigned start_time_ns, end_time_ns, time_spend_ns;
 
 	addr1 = kmap_atomic(page1);
 	addr2 = kmap_atomic(page2);
-	ret = memcmp(addr1, addr2, PAGE_SIZE);
+	start_time_ns = ktime_get_ns();
+	ret = memcmpe(addr1, addr2, PAGE_SIZE, offset);
+	end_time_ns = ktime_get_ns();
 	kunmap_atomic(addr2);
 	kunmap_atomic(addr1);
+
+	time_spend_ns = end_time_ns - start_time_ns;
+	avg_memcmp_time_array[avg_memcmp_time_cell%100] = time_spend_ns;
+	avg_memcmp_time_cell++;
+
 	return ret;
 }
 
 static inline int pages_identical(struct page *page1, struct page *page2)
 {
-	return !memcmp_pages(page1, page2);
+	return !memcmp_pages(page1, page2, NULL);
 }
 
 static int write_protect_page(struct vm_area_struct *vma, struct page *page,
@@ -1555,6 +1612,7 @@ static __always_inline struct page *chain(struct stable_node **s_n_d,
 static struct page *stable_tree_search(struct page *page)
 {
 	int nid;
+	u32 diff_offset;
 	struct rb_root *root;
 	struct rb_node **new;
 	struct rb_node *parent;
@@ -1573,6 +1631,7 @@ static struct page *stable_tree_search(struct page *page)
 again:
 	new = &root->rb_node;
 	parent = NULL;
+	diff_offset = 0;
 
 	while (*new) {
 		struct page *tree_page;
@@ -1631,7 +1690,7 @@ again:
 			goto again;
 		}
 
-		ret = memcmp_pages(page, tree_page);
+		ret = memcmp_pages(page, tree_page, &diff_offset);
 		put_page(tree_page);
 
 		parent = *new;
@@ -1801,6 +1860,7 @@ chain_append:
 static struct stable_node *stable_tree_insert(struct page *kpage)
 {
 	int nid;
+	u32 diff_offset;
 	unsigned long kpfn;
 	struct rb_root *root;
 	struct rb_node **new;
@@ -1814,6 +1874,7 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 again:
 	parent = NULL;
 	new = &root->rb_node;
+	diff_offset = 0;
 
 	while (*new) {
 		struct page *tree_page;
@@ -1860,7 +1921,7 @@ again:
 			goto again;
 		}
 
-		ret = memcmp_pages(kpage, tree_page);
+		ret = memcmp_pages(kpage, tree_page, &diff_offset);
 		put_page(tree_page);
 
 		parent = *new;
@@ -1925,6 +1986,7 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 	struct rb_root *root;
 	struct rb_node *parent = NULL;
 	int nid;
+	u32 diff_offset = 0;
 
 	nid = get_kpfn_nid(page_to_pfn(page));
 	root = root_unstable_tree + nid;
@@ -1949,7 +2011,7 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 			return NULL;
 		}
 
-		ret = memcmp_pages(page, tree_page);
+		ret = memcmp_pages(page, tree_page, &diff_offset);
 
 		parent = *new;
 		if (ret < 0) {
@@ -3042,6 +3104,18 @@ static ssize_t pages_unshared_show(struct kobject *kobj,
 }
 KSM_ATTR_RO(pages_unshared);
 
+static ssize_t avg_memcmp_time_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	long unsigned sum = 0;
+	int i;
+	for (i = 0; i < 100; i++) {
+		sum += avg_memcmp_time_array[i];
+	}
+	return sprintf(buf, "%lu\n", sum/100);
+}
+KSM_ATTR_RO(avg_memcmp_time);
+
 static ssize_t pages_volatile_show(struct kobject *kobj,
 				   struct kobj_attribute *attr, char *buf)
 {
@@ -3114,6 +3188,7 @@ static struct attribute *ksm_attrs[] = {
 	&pages_sharing_attr.attr,
 	&pages_unshared_attr.attr,
 	&pages_volatile_attr.attr,
+	&avg_memcmp_time_attr.attr,
 	&full_scans_attr.attr,
 #ifdef CONFIG_NUMA
 	&merge_across_nodes_attr.attr,
