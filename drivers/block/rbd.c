@@ -5906,7 +5906,8 @@ static ssize_t do_rbd_add(struct bus_type *bus,
 	list_add_tail(&rbd_dev->node, &rbd_dev_list);
 	spin_unlock(&rbd_dev_list_lock);
 
-	pr_info("%s: capacity %llu features 0x%llx\n", rbd_dev->disk->disk_name,
+	pr_info("%s: image %s: capacity %llu features 0x%llx\n", rbd_dev->disk->disk_name,
+		rbd_dev->spec->image_name,
 		(unsigned long long)get_capacity(rbd_dev->disk) << SECTOR_SHIFT,
 		rbd_dev->header.features);
 	rc = count;
@@ -6031,6 +6032,9 @@ static ssize_t do_rbd_remove(struct bus_type *bus,
 		blk_mq_freeze_queue(rbd_dev->disk->queue);
 		blk_set_queue_dying(rbd_dev->disk->queue);
 	}
+
+	pr_info("unmap %s: image %s\n", rbd_dev->disk->disk_name,
+		rbd_dev->spec->image_name);
 
 	del_gendisk(rbd_dev->disk);
 	spin_lock(&rbd_dev_list_lock);
